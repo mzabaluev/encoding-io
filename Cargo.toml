@@ -1,0 +1,5 @@
+[package]
+
+name = "encoding-io"
+version = "0.0.1-dev"
+authors = ["Mikhail Zabaluev <mikhail.zabaluev@gmail.com>"]
