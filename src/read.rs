@@ -90,7 +90,7 @@ impl<R, D> io::Read for Reader<R, D> where R: io::BufRead, D: Decode {
             let v = g.get_mut();
             self.read_to_end(v)
         }.and_then(|()| {
-            g.commit();
+            unsafe { g.commit(); }
             Ok(())
         })
     }

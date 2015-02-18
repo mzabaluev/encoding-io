@@ -27,19 +27,17 @@ impl<'a> VecMut<'a> {
         self.vec_ref
     }
 
-    pub fn commit(&mut self) {
+    pub unsafe fn commit(&mut self) {
         let s = {
             let v = self.get_mut();
             let ptr = v.as_ptr() as *mut _;
             let len = v.len();
             let cap = v.capacity();
-            unsafe {
-                let s: &'a mut String = transmute(v);
-                *s = String::from_raw_parts(ptr, len, cap);
-                s
-            }
+            let s: &'a mut String = transmute(v);
+            *s = String::from_raw_parts(ptr, len, cap);
+            s
         };
-        *self = unsafe { VecMut::new(s) };
+        *self = VecMut::new(s);
     }
 }
 
@@ -51,6 +49,6 @@ impl<'a> Drop for VecMut<'a> {
             let v = self.get_mut();
             unsafe { v.set_len(len); }
         }
-        self.commit();
+        unsafe { self.commit() };
     }
 }
