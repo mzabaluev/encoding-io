@@ -7,7 +7,6 @@
 // except according to those terms.
 
 use decode::Decode;
-use util::VecMut;
 
 use std::io;
 use std::slice::bytes;
@@ -24,6 +23,26 @@ impl<R, D> Reader<R, D> where R: io::BufRead, D: Decode {
             reader: reader,
             decoder: decoder,
             spillover: io::Cursor::new(Vec::new())
+        }
+    }
+}
+
+macro_rules! read_to_buf {
+    ($this:expr, $buf:expr, $iter_method:ident) => {
+        loop {
+            let in_consumed = {
+                let buf_read = try!($this.reader.fill_buf());
+                let decoded = try!($this.decoder.decode(buf_read));
+                $buf.extend(decoded.output().$iter_method());
+                let in_consumed = decoded.input_len();
+                if in_consumed == 0 {
+                    debug_assert!(buf_read.is_empty(),
+                        "the decoder returned EOF on non-empty input");
+                    break;
+                }
+                in_consumed
+            };
+            $this.reader.consume(in_consumed);
         }
     }
 }
@@ -65,33 +84,12 @@ impl<R, D> io::Read for Reader<R, D> where R: io::BufRead, D: Decode {
     }
 
     fn read_to_end(&mut self, buf: &mut Vec<u8>) -> io::Result<()> {
-        loop {
-            let in_consumed = {
-                let buf_read = try!(self.reader.fill_buf());
-                let decoded = try!(self.decoder.decode(buf_read));
-                buf.extend(decoded.output().bytes());
-                let in_consumed = decoded.input_len();
-                if in_consumed == 0 {
-                    debug_assert!(buf_read.is_empty(),
-                        "the decoder returned EOF on non-empty input");
-                    break;
-                }
-                in_consumed
-            };
-            self.reader.consume(in_consumed);
-        }
+        read_to_buf!(self, buf, bytes);
         Ok(())
     }
 
     fn read_to_string(&mut self, buf: &mut String) -> io::Result<()> {
-        // Use the fact that successful reading always produces valid UTF-8
-        let mut g = unsafe { VecMut::new(buf) };
-        {
-            let v = g.get_mut();
-            self.read_to_end(v)
-        }.and_then(|()| {
-            unsafe { g.commit(); }
-            Ok(())
-        })
+        read_to_buf!(self, buf, chars);
+        Ok(())
     }
 }
