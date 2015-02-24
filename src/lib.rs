@@ -6,6 +6,8 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
+#![allow(unstable_features)]
+
 #![feature(core)]
 #![feature(io)]
 #![feature(unsafe_destructor)]
@@ -19,5 +21,3 @@ pub mod decoders {
 
     mod utf8;
 }
-
-mod util;
