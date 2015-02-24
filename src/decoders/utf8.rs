@@ -15,13 +15,15 @@ use std::slice::bytes;
 use std::str;
 
 pub struct Utf8 {
-    stitch: [u8; 4],
-    stitch_len: u32
+    // Length of the sequence accumulated in `stitch`
+    stitch_len: u32,
+    // Room for an UTF-8 sequence plus a byte for a speculative copy
+    stitch: [u8; 5]
 }
 
 impl Utf8 {
     pub fn new() -> Utf8 {
-        Utf8 { stitch: [0; 4], stitch_len: 0 }
+        Utf8 { stitch: [0; 5], stitch_len: 0 }
     }
 }
 
@@ -143,36 +145,43 @@ impl Utf8 {
         self.stitch[have_len] = input[0];
         let need_len = UTF8_SEQ_LEN[self.stitch[0] as usize];
         let partial_len = min(need_len - have_len, input.len());
-        bytes::copy_memory(&mut self.stitch[have_len + 1
-                                            .. have_len + partial_len],
-                           &input[1 .. partial_len]);
-        self.stitch_len = (have_len + partial_len) as u32;
+        if partial_len != 0 {
+            bytes::copy_memory(&mut self.stitch[have_len + 1
+                                                .. have_len + partial_len],
+                               &input[1 .. partial_len]);
+            self.stitch_len = (have_len + partial_len) as u32;
+        }
         partial_len
     }
 }
 
 impl Decode for Utf8 {
-    fn decode<'a>(&'a mut self, input: &'a [u8]) -> decode::Result<Decoded<'a>> {
+    fn decode<'a, 'b>(&'a mut self, input: &'b [u8])
+                     -> decode::Result<Decoded<'a, 'b>>
+    {
         if self.stitch_len != 0 {
-            // Try to complete the accumulated partial sequence
             if input.len() == 0 {
-                return Err(DecodeError::new(
-                    "input ends with an incomplete UTF-8 sequence"));
+                let out = self.output();
+                if out.is_empty() {
+                    return Err(DecodeError::new(
+                        "input ends with an incomplete UTF-8 sequence"));
+                }
+                return Decoded::some(0, out);
             }
+            // Try to complete the accumulated partial sequence
             let partial_len = self.take_partial(input);
-            let seq_len = try! {
-                validate_next(&self.stitch[.. self.stitch_len as usize])
-            };
-            if seq_len == 0 {
-                // Some more input bytes have been copied into self.stitch,
-                // but no complete sequence yet 
-                return Decoded::ok(partial_len, "");
+            match validate_next(&self.stitch[.. self.stitch_len as usize]) {
+                Ok(len) => {
+                    let output = unsafe {
+                        str::from_utf8_unchecked(&self.stitch[0 .. len])
+                    };
+                    return Decoded::some(partial_len, output);
+                }
+                Err(e) => {
+                    self.stitch_len -= partial_len as u32;
+                    return Err(e);
+                }
             }
-            self.stitch_len = 0;
-            let output = unsafe {
-                str::from_utf8_unchecked(&self.stitch[.. seq_len])
-            };
-            return Decoded::ok(seq_len, output);
         }
 
         let mut i: usize = 0;
@@ -183,22 +192,37 @@ impl Decode for Utf8 {
             let seq_len = try!(validate_next(&input[i ..]));
             if seq_len == 0 {
                 if i != 0 {
-                    // An incomplete sequence, but we have something to output
+                    // An incomplete sequence at the end,
+                    // but there is some UTF-8 to return in place
                     break;
                 }
                 // An incomplete input sequence and nothing to output.
                 // Accumulate it in the partial buffer.
                 let partial_len = self.take_partial(input);
-                return Decoded::ok(partial_len, "");
+                return Decoded::some(partial_len, "");
             }
             i += seq_len;
         }
-        let output = unsafe { str::from_utf8_unchecked(&input[.. i]) };
-        Decoded::ok(i, output)
+        Decoded::in_place(unsafe { str::from_utf8_unchecked(&input[.. i]) })
     }
 
-    fn reset(&mut self) -> decode::Result<()> {
+    fn output(&self) -> &str {
+        if self.stitch_len == 0 {
+            return "";
+        }
+        let complete_len = UTF8_SEQ_LEN[self.stitch[0] as usize] as u32;
+        if self.stitch_len != complete_len {
+            return "";
+        }
+        let out = &self.stitch[0 .. (self.stitch_len as usize)];
+        unsafe { str::from_utf8_unchecked(out) }
+    }
+
+    fn consume(&mut self) {
         self.stitch_len = 0;
-        Ok(())
+    }
+
+    fn reset(&mut self) {
+        self.stitch_len = 0;
     }
 }

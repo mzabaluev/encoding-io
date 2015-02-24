@@ -11,32 +11,29 @@ use errors::DecodeError;
 use std::result::Result as StdResult;
 
 pub trait Decode {
-    fn decode<'a>(&'a mut self, input: &'a [u8]) -> Result<Decoded<'a>>;
-    fn reset(&mut self) -> Result<()>;
+    fn decode<'a, 'b>(&'a mut self, input: &'b [u8]) -> Result<Decoded<'a, 'b>>;
+    fn output(&self) -> &str;
+    fn consume(&mut self);
+    fn reset(&mut self);
 }
 
 pub type Result<T> = StdResult<T, DecodeError>;
 
-pub struct Decoded<'a> {
-    consumed: usize,
-    output: &'a str
+#[derive(Debug)]
+pub enum Decoded<'a, 'b> {
+    Some(usize, &'a str),
+    InPlace(&'b str)
 }
 
-impl<'a> Decoded<'a> {
+impl<'a, 'b> Decoded<'a, 'b> {
 
     #[inline]
-    pub fn ok(input_len: usize, output: &'a str) -> Result<Decoded<'a>> {
-        Ok(Decoded { consumed: input_len, output: output })
+    pub fn some(input_len: usize, output: &'a str) -> Result<Decoded<'a, 'b>> {
+        Ok(Decoded::Some(input_len, output))
     }
 
     #[inline]
-    pub fn input_len(&self) -> usize { self.consumed }
-
-    #[inline]
-    pub fn output(&self) -> &'a str { self.output }
-
-    #[inline]
-    pub fn is_eof(&self) -> bool {
-        self.consumed == 0 && self.output.is_empty()
+    pub fn in_place(part: &'b str) -> Result<Decoded<'a, 'b>> {
+        Ok(Decoded::InPlace(part))
     }
 }

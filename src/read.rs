@@ -6,90 +6,185 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-use decode::Decode;
+use decode::{Decode, Decoded};
 
+use std::cmp::min;
 use std::io;
+use std::io::{Read, BufRead};
 use std::slice::bytes;
+use std::str;
 
 pub struct Reader<R, D> {
     reader: R,
     decoder: D,
-    spillover: io::Cursor<Vec<u8>>
+    state: BufState
 }
 
-impl<R, D> Reader<R, D> where R: io::BufRead, D: Decode {
+#[derive(Copy, Eq, PartialEq)]
+enum BufState {
+    Empty,
+    Decoded { pos: usize },
+    InPlace { len: usize }
+}
+
+impl<R, D> Reader<R, D> where R: BufRead, D: Decode {
     pub fn new(reader: R, decoder: D) -> Reader<R, D> {
-        Reader {
-            reader: reader,
-            decoder: decoder,
-            spillover: io::Cursor::new(Vec::new())
-        }
+        Reader { reader: reader, decoder: decoder, state: BufState::Empty }
     }
-}
 
-macro_rules! read_to_buf {
-    ($this:expr, $buf:expr, $iter_method:ident) => {
+    fn read_to_end_fast_with<F>(&mut self, mut process: F) -> io::Result<()>
+        where F: FnMut(&str)
+    {
+        debug_assert!(self.state == BufState::Empty);
+
+        // Fast-pace trough the output, no need to change states
         loop {
-            let in_consumed = {
-                let buf_read = try!($this.reader.fill_buf());
-                let decoded = try!($this.decoder.decode(buf_read));
-                $buf.extend(decoded.output().$iter_method());
-                let in_consumed = decoded.input_len();
-                if in_consumed == 0 {
-                    debug_assert!(buf_read.is_empty(),
-                        "the decoder returned EOF on non-empty input");
-                    break;
-                }
-                in_consumed
-            };
-            $this.reader.consume(in_consumed);
-        }
-    }
-}
-
-impl<R, D> io::Read for Reader<R, D> where R: io::BufRead, D: Decode {
-
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if !self.spillover.get_ref().is_empty() {
-            let res_drain = self.spillover.read(buf);
-            match res_drain {
-                Ok(len) => {
-                    if len != 0 {
-                        return res_drain;
-                    } else {
-                        self.spillover.set_position(0);
-                        self.spillover.get_mut().clear();
+            let (in_consumed, amt_read) = {
+                let read_buf = try!(self.reader.fill_buf());
+                let decoded = try!(self.decoder.decode(read_buf));
+                match decoded {
+                    Decoded::Some(in_consumed, out) => {
+                        process(out);
+                        (in_consumed, out.len())
+                    }
+                    Decoded::InPlace(s) => {
+                        debug_assert!(s.as_ptr() == read_buf.as_ptr(),
+                            "decoder returned in-place data not at the start of the input buffer");
+                        process(s);
+                        let in_len = s.len();
+                        (in_len, in_len)
                     }
                 }
-                Err(e) => panic!(e)
+            };
+            self.reader.consume(in_consumed);
+            self.decoder.consume();
+            if amt_read == 0 {
+                break;
             }
         }
-        let (in_consumed, buf_filled) = {
-            let buf_read = try!(self.reader.fill_buf());
-            let decoded = try!(self.decoder.decode(buf_read));
-            let out = decoded.output().as_bytes();
-            let buf_filled = if out.len() < buf.len() {
-                bytes::copy_memory(buf, out);
-                out.len()
-            } else {
-                let (fit, rest) = out.split_at(buf.len());
-                bytes::copy_memory(buf, fit);
-                self.spillover.get_mut().extend(rest.iter().cloned());
-                buf.len()
-            };
-            (decoded.input_len(), buf_filled)
+        Ok(())
+    }
+}
+
+impl<R, D> Read for Reader<R, D> where R: BufRead, D: Decode {
+
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let amt = {
+            let decoded_buf = try!(self.fill_buf());
+            let amt = min(buf.len(), decoded_buf.len());
+            bytes::copy_memory(&mut buf[0 .. amt], &decoded_buf[0 .. amt]);
+            amt
         };
-        self.reader.consume(in_consumed);
-        Ok(buf_filled)
+        self.consume(amt);
+        Ok(amt)
     }
 
     fn read_to_end(&mut self, buf: &mut Vec<u8>) -> io::Result<()> {
-        read_to_buf!(self, buf, bytes);
-        Ok(())
+        // Deal with possible partially read input
+        let read_len = {
+            let read_buf = try!(self.fill_buf());
+            buf.extend(read_buf.iter().cloned());
+            read_buf.len()
+        };
+        self.consume(read_len);
+        self.read_to_end_fast_with(|s| { buf.extend(s.bytes()) })
     }
 
     fn read_to_string(&mut self, buf: &mut String) -> io::Result<()> {
-        read_to_buf!(self, buf, chars);
-        Ok(())
+        // The reader might have been partially read from. Deal with it.
+        {
+            let partial_input: &[u8] = match self.state {
+                BufState::Empty => &[],
+                BufState::Decoded { pos } => {
+                    &self.decoder.output().as_bytes()[pos ..]
+                }
+                BufState::InPlace { len } => {
+                    let read_buf = try!(self.reader.fill_buf());
+                    &read_buf[0 .. len]
+                }
+            };
+            match str::from_utf8(partial_input) {
+                Ok(s) => {
+                    buf.push_str(s);
+                }
+                Err(_) => {
+                    return Err(io::Error::new(io::ErrorKind::InvalidInput,
+                        "cannot read a complete UTF-8 string due to preceding reads",
+                        None));
+                }
+            }
+        }
+        self.decoder.consume();
+        self.state = BufState::Empty;
+        self.read_to_end_fast_with(|s| { buf.push_str(s) })
+    }
+}
+
+impl<R, D> BufRead for Reader<R, D> where R: BufRead, D: Decode {
+    fn fill_buf(&mut self) -> io::Result<&[u8]> {
+        loop {
+            match self.state {
+                BufState::Empty => { }
+                BufState::Decoded { pos } => {
+                    let out = self.decoder.output();
+                    return Ok(&out.as_bytes()[pos ..]);
+                }
+                BufState::InPlace { len } => {
+                    // We had some validated UTF-8 in the input,
+                    // and we should get the remaining part of it again
+                    // from the buffered reader.
+                    let buf = try!(self.reader.fill_buf());
+                    return Ok(&buf[0 .. len]);
+                }
+            }
+            let in_consumed = {
+                let buf = try!(self.reader.fill_buf());
+                let decoded = try!(self.decoder.decode(buf));
+                match decoded {
+                    Decoded::Some(in_consumed, _) => {
+                        self.state = BufState::Decoded { pos: 0 };
+                        in_consumed
+                    }
+                    Decoded::InPlace(s) => {
+                        self.state = BufState::InPlace { len: s.len() };
+                        0
+                    }
+                }
+            };
+            self.reader.consume(in_consumed);
+        }
+    }
+
+    fn consume(&mut self, amt: usize) {
+        match self.state {
+            BufState::Empty => {
+                debug_assert!(amt == 0,
+                    "request to consume exceeds the output");
+            }
+            BufState::Decoded { pos } => {
+                let new_pos = pos + amt;
+                let buf_len = self.decoder.output().len();
+                debug_assert!(new_pos <= buf_len,
+                    "request to consume exceeds the output");
+                if new_pos == buf_len {
+                    self.decoder.consume();
+                    self.state = BufState::Empty;
+                } else {
+                    self.state = BufState::Decoded { pos: new_pos };
+                }
+            }
+            BufState::InPlace { len } => {
+                debug_assert!(amt <= len,
+                    "request to consume exceeds the output");
+                self.reader.consume(amt);
+                let new_len = len - amt;
+                self.state =
+                    if new_len == 0 {
+                        BufState::Empty
+                    } else {
+                        BufState::InPlace { len: new_len }
+                    };
+            }
+        }
     }
 }
