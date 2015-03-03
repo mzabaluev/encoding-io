@@ -9,6 +9,7 @@
 use decode;
 use decode::{Decode, Decoded};
 use errors::DecodeError;
+use errors::DecodeErrorKind::{InvalidInput, PartialInput};
 
 use std::cmp::min;
 use std::slice::bytes;
@@ -28,8 +29,9 @@ impl Utf8 {
 }
 
 macro_rules! seq_error {
-    () => {
-        return Err(DecodeError::new("stream did not contain valid UTF-8"));
+    ($skip_len:expr) => {
+        return Err(DecodeError::new(InvalidInput, $skip_len,
+                                    "stream did not contain valid UTF-8"));
     }
 }
 
@@ -39,7 +41,7 @@ macro_rules! match_seq {
             ($s, $off + 1) {
                 match $s[$off] {
                     $p1 => Ok($off + 1),
-                    _   => seq_error!()
+                    _   => seq_error!($off)
                 }
             }
         }
@@ -49,7 +51,7 @@ macro_rules! match_seq {
             ($s, $off + 1) {
                 match $s[$off] {
                     $p1 => match_seq!($s, $off + 1, $ensure_len, $p2),
-                    _   => seq_error!()
+                    _   => seq_error!($off)
                 }
             }
         }
@@ -59,7 +61,7 @@ macro_rules! match_seq {
             ($s, $off + 1) {
                 match $s[$off] {
                     $p1 => match_seq!($s, $off + 1, $ensure_len, $p2, $p3),
-                    _   => seq_error!()
+                    _   => seq_error!($off)
                 }
             }
         }
@@ -91,7 +93,7 @@ macro_rules! validate_next_impl {
             0xF4 =>
                 match_seq!($s, 1, $ensure_len,
                            0x80 ... 0x8F, 0x80 ... 0xBF, 0x80 ... 0xBF),
-            _ => seq_error!()
+            _ => seq_error!(1)
         }
     }
 }
@@ -153,6 +155,42 @@ impl Utf8 {
         }
         partial_len
     }
+
+    fn exhaust_valid(&mut self, input: &[u8]) -> decode::Result<usize> {
+        let mut i: usize = 0;
+        while input.len() - i >= 4 {
+            match validate_next_bulk(&input[i .. i + 4]) {
+                Ok(seq_len) => {
+                    i += seq_len;
+                }
+                Err(e) => {
+                    if i == 0 {
+                        return Err(e);
+                    } else {
+                        return Ok(i);
+                    }
+                }
+            }
+        }
+        while i < input.len() {
+            match validate_next(&input[i ..]) {
+                Ok(seq_len) => {
+                    if seq_len == 0 {
+                        break;
+                    }
+                    i += seq_len;
+                }
+                Err(e) => {
+                    if i == 0 {
+                        return Err(e);
+                    } else {
+                        return Ok(i);
+                    }
+                }
+            }
+        }
+        Ok(i)
+    }
 }
 
 impl Decode for Utf8 {
@@ -164,6 +202,7 @@ impl Decode for Utf8 {
                 let out = self.output();
                 if out.is_empty() {
                     return Err(DecodeError::new(
+                        PartialInput, out.len(),
                         "input ends with an incomplete UTF-8 sequence"));
                 }
                 return Decoded::some(0, out);
@@ -184,24 +223,12 @@ impl Decode for Utf8 {
             }
         }
 
-        let mut i: usize = 0;
-        while input.len() - i >= 4 {
-            i += try!(validate_next_bulk(&input[i .. i + 4]));
-        }
-        while i < input.len() {
-            let seq_len = try!(validate_next(&input[i ..]));
-            if seq_len == 0 {
-                if i != 0 {
-                    // An incomplete sequence at the end,
-                    // but there is some UTF-8 to return in place
-                    break;
-                }
-                // An incomplete input sequence and nothing to output.
-                // Accumulate it in the partial buffer.
-                let partial_len = self.take_partial(input);
-                return Decoded::some(partial_len, "");
-            }
-            i += seq_len;
+        let i = try!(self.exhaust_valid(input));
+        if i == 0 && input.len() != 0 {
+            // An incomplete input sequence and nothing to output.
+            // Accumulate it in the partial buffer.
+            let partial_len = self.take_partial(input);
+            return Decoded::some(partial_len, "");
         }
         Decoded::in_place(unsafe { str::from_utf8_unchecked(&input[.. i]) })
     }
