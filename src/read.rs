@@ -138,14 +138,16 @@ impl<R, D> BufRead for Reader<R, D> where R: BufRead, D: Decode {
                 }
             }
             let in_consumed = {
-                let buf = try!(self.reader.fill_buf());
-                let decoded = try!(self.decoder.decode(buf));
+                let read_buf = try!(self.reader.fill_buf());
+                let decoded = try!(self.decoder.decode(read_buf));
                 match decoded {
                     Decoded::Some(in_consumed, _) => {
                         self.state = BufState::Decoded { pos: 0 };
                         in_consumed
                     }
                     Decoded::InPlace(s) => {
+                        debug_assert!(s.as_ptr() == read_buf.as_ptr(),
+                            "decoder returned in-place data not at the start of the input buffer");
                         self.state = BufState::InPlace { len: s.len() };
                         0
                     }
