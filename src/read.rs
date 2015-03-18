@@ -79,7 +79,8 @@ impl<R, D> Read for Reader<R, D> where R: BufRead, D: Decode {
         Ok(amt)
     }
 
-    fn read_to_end(&mut self, buf: &mut Vec<u8>) -> io::Result<()> {
+    fn read_to_end(&mut self, buf: &mut Vec<u8>) -> io::Result<usize> {
+        let pre_len = buf.len();
         // Deal with possible partially read input
         let read_len = {
             let read_buf = try!(self.fill_buf());
@@ -87,10 +88,12 @@ impl<R, D> Read for Reader<R, D> where R: BufRead, D: Decode {
             read_buf.len()
         };
         self.consume(read_len);
-        self.read_to_end_fast_with(|s| { buf.extend(s.bytes()) })
+        try!(self.read_to_end_fast_with(|s| { buf.extend(s.bytes()) }));
+        Ok(buf.len() - pre_len)
     }
 
-    fn read_to_string(&mut self, buf: &mut String) -> io::Result<()> {
+    fn read_to_string(&mut self, buf: &mut String) -> io::Result<usize> {
+        let pre_len = buf.len();
         // The reader might have been partially read from. Deal with it.
         {
             let partial_input: &[u8] = match self.state {
@@ -116,7 +119,8 @@ impl<R, D> Read for Reader<R, D> where R: BufRead, D: Decode {
         }
         self.decoder.consume();
         self.state = BufState::Empty;
-        self.read_to_end_fast_with(|s| { buf.push_str(s) })
+        try!(self.read_to_end_fast_with(|s| { buf.push_str(s) }));
+        Ok(buf.len() - pre_len)
     }
 }
 
